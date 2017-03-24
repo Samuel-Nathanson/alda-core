@@ -86,16 +86,6 @@
         appended-event (update current-event :content conj event)]
     (-> parser (update :stack #(-> % pop (conj appended-event))))))
 
-(defn open-event?
-  [event-type]
-  (fn [{:keys [stack] :as parser}]
-    (->> stack
-         (filter (fn [{:keys [type open?]}] (and (= event-type type) open?)))
-         last)))
-
-(def open-event-seq? (open-event? :event-seq))
-(def open-set-variable? (open-event? :set-variable))
-
 (defn last-open-event
   [{:keys [stack] :as parser}]
   (->> stack
@@ -155,6 +145,20 @@
         (push-event {:type :event-seq
                      :content seq-events}))))
 
+(defn push-instrument-call
+  [{:keys [stack] :as parser}]
+  {:pre [(= :instrument-call (:type (last-open-event parser)))]}
+  (let [contents (->> stack
+                      reverse
+                      (take-while #(not (= :instrument-call (:type %))))
+                      reverse)]
+    (-> parser
+        (update :stack #(->> %
+                             (drop-last (inc (count contents)))
+                             vec))
+        (push-event {:type :instrument-call
+                     :content contents}))))
+
 (defn ensure-parsing
   "If the parser's state is not :parsing, short-circuits the parser so that the
    current state is passed through until the end.
@@ -208,6 +212,13 @@
       (-> parser (append-to-current-event {:type :barline}))
       (-> parser (push-event {:type :barline})))))
 
+(defn parse-colon
+  [parser token]
+  (when (token-is :colon token)
+    (if (= :instrument-call (:type (last-open-event parser)))
+      (-> parser push-instrument-call)
+      (-> parser (unexpected-token-error token)))))
+
 (defn parse-clj-expr
   [parser token]
   (when (token-is :clj-expr token)
@@ -220,6 +231,13 @@
   (when (token-is :name token)
     (-> parser (push-event {:type :name
                             :content (token-content token)}))))
+(defn parse-nickname
+  [parser token]
+  (when (token-is :nickname token)
+    (if (= :instrument-call (:type (last-open-event parser)))
+      (-> parser (push-event {:type :nickname
+                              :content (token-content token)}))
+      (-> parser (unexpected-token-error token)))))
 
 (defn parse-note-length
   [parser token]
@@ -259,11 +277,15 @@
       (-> parser (append-to-current-event {:type :tie}))
       (-> parser (unexpected-token-error token)))))
 
-(defn start-parsing-names
-  [parser token]
-  (when (token-is :slash token)
+(defn start-parsing-instrument-call
+  [parser]
+  (let [first-name (current-event-content parser)]
     (-> parser
-        (rename-current-event :names))))
+        (update :stack pop)
+        (push-event {:type :instrument-call})
+        open-current-event
+        (push-event {:type    :name
+                     :content first-name}))))
 
 (defn start-parsing-note
   [parser token]
@@ -304,10 +326,12 @@
 
 (defn disambiguate-name
   [p t]
-  (when (= :name (current-event-type p))
+  (when (and (= :name (current-event-type p))
+             (not= :instrument-call (:type (last-open-event p))))
     (case (token-type t)
-      :equals (start-parsing-set-variable p t)
-      :slash  (start-parsing-names p t)
+      :equals   (start-parsing-set-variable p t)
+      :slash    (start-parsing-instrument-call p)
+      :nickname (-> p start-parsing-instrument-call (read-token! t))
       (-> p
           (rename-current-event :get-variable)
           (read-token! t)))))
@@ -324,8 +348,10 @@
         (disambiguate-name p t)
         (parse-accidentals p t)
         (parse-barline p t)
+        (parse-colon p t)
         (parse-clj-expr p t)
         (parse-name p t)
+        (parse-nickname p t)
         (parse-note-length p t)
         (parse-octave-change p t)
         (parse-repeat p t)
